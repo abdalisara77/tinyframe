@@ -1,7 +1,8 @@
 /*
  * E-paper video player -- Elecrow CrowPanel ESP32 4.2" (400x300 mono, UC8176).
  *
- * Plays the baked-in clips on a loop. OK (middle button) switches clip.
+ * Plays every baked-in clip once, in order, and then sleeps. OK (middle
+ * button) cuts the current one short and moves to the next.
  * EXIT latches the current frame and sleeps, so the cord can be pulled.
  *
  * Clips come from clips.h, which ../make_eink_video.py generates from every
@@ -59,8 +60,6 @@
 #define SETTLE_MS 100
 #endif
 
-
-#define PLAYS_BEFORE_PARK 5 // passes before the panel parks itself and sleeps
 
 #define FRAME_BYTES (EPD_W * EPD_H / 8)   // 400 * 300 / 8 = 15000
 
@@ -243,26 +242,30 @@ void setup() {
 }
 
 void loop() {
-  static uint8_t passes = 0;
   const Clip &c = CLIPS[clipIdx];
   uint32_t t0 = millis();
+  uint16_t shown = 0;
 
   for (uint16_t i = 0; i < c.frames; i++) {
     showFrame(c, i);
+    shown++;
     if (parkNow) park();          // does not return
-    if (nextClip) {
+    if (nextClip) {               // OK: cut this one short, move along
       nextClip = false;
-      clipIdx = (clipIdx + 1) % CLIP_COUNT;
-      passes = 0;
-      return;                     // restart loop() on the new clip
+      break;
     }
   }
 
   uint32_t ms = millis() - t0;
-  passes++;
-  Serial.printf("'%s' pass %u/%d: %u frames, %lu ms/frame\n",
-                c.name, passes, PLAYS_BEFORE_PARK, c.frames,
-                (unsigned long)(ms / c.frames));
+  Serial.printf("'%s' (%u/%u): %u frames, %lu ms/frame\n",
+                c.name, clipIdx + 1, CLIP_COUNT, shown,
+                (unsigned long)(ms / (shown ? shown : 1)));
 
-  if (passes >= PLAYS_BEFORE_PARK) park();
+  // One pass through every picture, in order, and then stop -- the panel is
+  // bistable, so stopping leaves the last picture up rather than blank.
+  //
+  // clipIdx survives deep sleep, which is why setup() winds it back to 0 when
+  // it is out of range: a wake starts a fresh round from the first picture
+  // instead of resuming past the end of the last one.
+  if (++clipIdx >= CLIP_COUNT) park();
 }
