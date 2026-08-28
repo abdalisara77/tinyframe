@@ -60,6 +60,62 @@
 #define SETTLE_MS 100
 #endif
 
+// The resting frame is a different problem from playback, and the difference
+// is not exposure -- that was the first two guesses and both were wrong.
+//
+// Measured on the glass: the waveform takes 1115ms to finish. Playback cuts it
+// at SETTLE_MS=100 and gets away with it, because the next frame arrives and
+// corrects whatever was left half done. The parked frame has no next frame, so
+// cutting it early left pixels mid-swing and the picture drifted away.
+//
+// Letting it finish fixed the fade and exposed the next thing: the late phases
+// of this LUT drive towards the opposite polarity, so a completed waveform
+// lands on the inverse of the picture a 100ms cut produces. INVERT=1 was tuned
+// against the cut, not against the finished state. So the resting frame is
+// complemented before it is pushed, and the completed waveform then lands on
+// the same picture playback was showing.
+//
+// (PARK_REINFORCE, which wrote the image to DTM1/0x10 as well as DTM2/0x13,
+// lived here for a while on the theory that the old buffer was undefined after
+// the reset. It was not the cause -- the inversion predated it -- and it broke
+// the rule at the top of this file that every frame goes through the same
+// registers, so it is gone.)
+#ifndef PARK_INVERT
+#define PARK_INVERT 1
+#endif
+
+// Drive every pixel the full distance when parking.
+//
+// DTM1 (0x10) is the image the controller believes it is coming FROM, DTM2
+// (0x13) the one it is going TO, and the LUT picks a path per pixel from that
+// pair. Playback only ever writes DTM2, which is fine there -- a pixel routed
+// down a no-change path and left untouched gets another chance a tenth of a
+// second later. The resting frame gets no second chance, and a pixel that was
+// never driven never reaches a rail, so it leaks. That is the fade.
+//
+// Writing DTM1 as the exact inverse of DTM2 forces every pixel to transition,
+// which is the hardest the panel can drive it. It also means the whole screen
+// visibly swings on the way through, which is what a full e-paper refresh
+// looks like and is why parking flashes before it settles.
+//
+// (An earlier version wrote DTM1 equal to DTM2 instead, to "hold" each pixel.
+// That is the opposite of what is wanted here: equal means no transition,
+// which means no drive, which is the thing that fades.)
+#ifndef PARK_FULL_SWING
+#define PARK_FULL_SWING 1
+#endif
+
+#ifndef PARK_POWER_OFF
+#define PARK_POWER_OFF 1
+#endif
+
+// Longest the resting frame is allowed to take before we stop waiting on it.
+// A full waveform is seconds, not milliseconds; this is only a backstop so a
+// panel that never reports finished cannot hang the sketch forever.
+#ifndef PARK_MAX_WAIT_MS
+#define PARK_MAX_WAIT_MS 10000
+#endif
+
 
 #define FRAME_BYTES (EPD_W * EPD_H / 8)   // 400 * 300 / 8 = 15000
 
@@ -131,13 +187,53 @@ static void settle(uint32_t ms) {
 //
 // EPD_Sleep() is DSLP alone, no POF. That is deliberate: POF aborts the
 // waveform outright and all you get is the opening black/white flash phases.
-static void pushFrame(uint32_t drawMs, bool powerDown = false) {
+static void pushFrame(uint32_t drawMs, bool powerDown = false,
+                      bool waitDone = false, bool fullSwing = false) {
   EPD_RESET();
   delay(10);
   EPD_Init();
   delay(50);
+
+  // Same registers and the same LUT as every other frame; this only fills in
+  // DTM1, the half of the pair playback never writes, and fills it with the
+  // inverse of what EPD_Display_Fast is about to put in DTM2.
+  if (fullSwing) {
+    EPD_WR_REG(0x10);
+    for (size_t i = 0; i < FRAME_BYTES; i++) EPD_WR_DATA8((uint8_t)~frameBuf[i]);
+  }
+
   EPD_Display_Fast(frameBuf);   // 0x50=0xD7, writes 0x13, lut_GC, 0x17/0xA5
-  settle(drawMs);
+
+  if (waitDone) {
+    // Let the waveform actually finish, instead of cutting it at drawMs.
+    //
+    // EPD_ReadBusy() cannot do this for us: it breaks when BUSY reads 0, and
+    // 0 is what this controller shows *while* it is busy, so it returns as the
+    // refresh starts rather than when it ends. That is why drawMs behaves like
+    // an exposure at all, and why 100 / 500 / 4000 give a faint, an inverted
+    // and a black picture -- three points in one long multi-phase waveform,
+    // not three strengths of one effect. Playback wants that cut; there is no
+    // 8fps otherwise. The resting frame does not.
+    //
+    // Polarity is read rather than assumed: after giving BUSY a moment to
+    // assert, whatever level it holds is this board's "busy", and we wait for
+    // it to leave that level. The serial line says which way round it was and
+    // how long the waveform really took -- if it reports ~0ms, BUSY never
+    // asserted and the wait is not doing anything.
+    delay(50);
+    const int busyLevel = digitalRead(BUSY);
+    const uint32_t t0 = millis();
+    while (digitalRead(BUSY) == busyLevel && millis() - t0 < PARK_MAX_WAIT_MS) {
+      delay(5);
+    }
+    const uint32_t waited = millis() - t0;
+    Serial.printf("park: BUSY held %d for %lu ms%s\n", busyLevel,
+                  (unsigned long)waited,
+                  waited >= PARK_MAX_WAIT_MS ? " (TIMED OUT)" : "");
+    Serial.flush();
+  } else {
+    settle(drawMs);
+  }
 
   // powerDown is for the resting frame only. EPD_Sleep() is DSLP alone, which
   // latches the controller off with the booster rails still charged; POF first
@@ -145,7 +241,7 @@ static void pushFrame(uint32_t drawMs, bool powerDown = false) {
   // stranded charge from bleeding back out when the supply dies, and it is NOT
   // used during playback -- POF on every frame aborts the next waveform and all
   // you get is the black/white flash.
-  if (powerDown) {
+  if (powerDown && PARK_POWER_OFF) {
     EPD_WR_REG(0x02);           // POF
     delay(200);
   }
@@ -198,10 +294,14 @@ static void park() {
   Serial.println("parking -- safe to unplug");
   Serial.flush();
 
-  // frameBuf still holds what is on screen. Same path, same exposure, so it
-  // looks identical to every other frame -- the only difference is that the
-  // rails come down deliberately afterwards instead of being left charged.
-  pushFrame(SETTLE_MS, true);
+  // frameBuf still holds what is on screen. Complement it so that a completed
+  // waveform lands on that same picture rather than its inverse, then push it
+  // through the identical path -- the only differences are that we wait for
+  // the waveform to finish and bring the rails down deliberately afterwards.
+#if PARK_INVERT
+  for (size_t i = 0; i < FRAME_BYTES; i++) frameBuf[i] = (uint8_t)~frameBuf[i];
+#endif
+  pushFrame(0, true, true, PARK_FULL_SWING);   // drawMs unused: waitDone replaces the cut
 
   // DO NOT pull GPIO7/GPIO41 low here. GPIO41 is the board's power-control
   // latch, not just display power: driving it low hard-powers-off the whole
