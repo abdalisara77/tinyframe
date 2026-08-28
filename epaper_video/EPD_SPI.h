@@ -39,6 +39,7 @@ void EPD_GPIOInit(void);
 void EPD_WR_Bus(uint8_t dat);
 void EPD_WR_REG(uint8_t reg);
 void EPD_WR_DATA8(uint8_t dat);
+void EPD_WR_DATA_BULK(const uint8_t *buf, uint32_t len);
 void SPI_Write(unsigned char value);
 
 #endif
