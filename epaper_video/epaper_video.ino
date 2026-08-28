@@ -119,6 +119,23 @@
 
 #define FRAME_BYTES (EPD_W * EPD_H / 8)   // 400 * 300 / 8 = 15000
 
+// Settle after the hard reset, and after the register init. Vendor values were
+// 10 and 50; neither is a measurement, and together they were 60ms of every
+// frame. The reset already holds RST long enough on its own, and EPD_Init is
+// register writes the controller acts on immediately.
+#ifndef RESET_SETTLE_MS
+#define RESET_SETTLE_MS 2
+#endif
+#ifndef INIT_SETTLE_MS
+#define INIT_SETTLE_MS 10
+#endif
+
+// Where a frame's time actually goes, filled in by pushFrame and reported once
+// per clip. "484 ms/frame" does not say what to cut, and this session has
+// already spent several flashes on theories that a breakdown would have
+// settled immediately.
+static uint32_t tReset, tInit, tData, tExpose, tSleep;
+
 // Buttons are active-low with pull-ups; pins from Elecrow's Example2_KEY.
 #define KEY_EXIT 1
 #define KEY_HOME 2
@@ -189,10 +206,13 @@ static void settle(uint32_t ms) {
 // waveform outright and all you get is the opening black/white flash phases.
 static void pushFrame(uint32_t drawMs, bool powerDown = false,
                       bool waitDone = false, bool fullSwing = false) {
+  const uint32_t m0 = millis();
   EPD_RESET();
-  delay(10);
+  delay(RESET_SETTLE_MS);
+  const uint32_t m1 = millis();
   EPD_Init();
-  delay(50);
+  delay(INIT_SETTLE_MS);
+  const uint32_t m2 = millis();
 
   // Same registers and the same LUT as every other frame; this only fills in
   // DTM1, the half of the pair playback never writes, and fills it with the
@@ -203,6 +223,7 @@ static void pushFrame(uint32_t drawMs, bool powerDown = false,
   }
 
   EPD_Display_Fast(frameBuf);   // 0x50=0xD7, writes 0x13, lut_GC, 0x17/0xA5
+  const uint32_t m3 = millis();
 
   if (waitDone) {
     // Let the waveform actually finish, instead of cutting it at drawMs.
@@ -234,6 +255,7 @@ static void pushFrame(uint32_t drawMs, bool powerDown = false,
   } else {
     settle(drawMs);
   }
+  const uint32_t m4 = millis();
 
   // powerDown is for the resting frame only. EPD_Sleep() is DSLP alone, which
   // latches the controller off with the booster rails still charged; POF first
@@ -246,6 +268,12 @@ static void pushFrame(uint32_t drawMs, bool powerDown = false,
     delay(200);
   }
   EPD_Sleep();                  // DSLP
+
+  tReset  = m1 - m0;
+  tInit   = m2 - m1;
+  tData   = m3 - m2;
+  tExpose = m4 - m3;
+  tSleep  = millis() - m4;
 }
 
 // ---------------------------------------------------------------- frames
@@ -357,9 +385,13 @@ void loop() {
   }
 
   uint32_t ms = millis() - t0;
-  Serial.printf("'%s' (%u/%u): %u frames, %lu ms/frame\n",
+  Serial.printf("'%s' (%u/%u): %u frames, %lu ms/frame"
+                "  [reset %lu  init %lu  data %lu  expose %lu  sleep %lu]\n",
                 c.name, clipIdx + 1, CLIP_COUNT, shown,
-                (unsigned long)(ms / (shown ? shown : 1)));
+                (unsigned long)(ms / (shown ? shown : 1)),
+                (unsigned long)tReset, (unsigned long)tInit,
+                (unsigned long)tData, (unsigned long)tExpose,
+                (unsigned long)tSleep);
 
   // One pass through every picture, in order, and then stop -- the panel is
   // bistable, so stopping leaves the last picture up rather than blank.

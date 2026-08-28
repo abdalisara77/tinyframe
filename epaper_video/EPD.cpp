@@ -1,3 +1,9 @@
+// SOURCE OF TRUTH for this board's driver.
+//
+// flash.sh copies this over ../EPD.cpp before every build, so edits made
+// directly to EPD.cpp are destroyed on the next flash -- silently, and
+// including anything already staged from it. Edit this file instead.
+
 #include "EPD.h"
 
 //LUT GC
@@ -155,21 +161,39 @@ void EPD_ReadBusy(void)
   }
 }
 
+// Shipped as 10/100/100ms: 210ms of every frame spent hard-resetting a
+// controller that was working correctly a moment earlier. Measured, that was
+// half the frame time. The part needs RST held low long enough to register and
+// a settle before it takes commands; 10ms each is still generous.
+//
+// A too-short reset does not fail cleanly -- it comes back as frames that are
+// blank, torn or intermittently wrong. Raise this first if that appears.
+#ifndef EPD_RESET_MS
+#define EPD_RESET_MS 10
+#endif
+
 void EPD_RESET(void)
 {
   EPD_RES_Set();
-  delay(10);
+  delay(2);
   EPD_RES_Clr();
-  delay(100);
+  delay(EPD_RESET_MS);
   EPD_RES_Set();
-  delay(100);
+  delay(EPD_RESET_MS);
 }
+
+// The 50ms was waiting for deep sleep to take hold. Nothing depends on it
+// during playback: the next frame opens with a hard reset, which is what wakes
+// the controller anyway.
+#ifndef EPD_SLEEP_MS
+#define EPD_SLEEP_MS 10
+#endif
 
 void EPD_Sleep(void)
 {
   EPD_WR_REG(0x07);
   EPD_WR_DATA8(0xA5);
-  delay(50);
+  delay(EPD_SLEEP_MS);
 }
 
 
@@ -369,19 +393,14 @@ void EPD_Display(const uint8_t *Image)
 
 void EPD_Display_Fast(const uint8_t *Image)
 {
-  uint16_t i, j, Width, Height;
+  uint16_t Width, Height;
   Width = (EPD_W % 8 == 0) ? (EPD_W / 8) : (EPD_W / 8 + 1);
   Height = EPD_H;
   EPD_WR_REG(0x50);
   EPD_WR_DATA8(0xD7);
-  EPD_WR_REG(0x13); 
-  for (j = 0; j < Height; j++)
-  {
-    for (i = 0; i < Width; i++)
-    {
-      EPD_WR_DATA8(Image[i + j * Width]);
-    }
-  }
+  EPD_WR_REG(0x13);
+  // One transfer with CS framed once, not 15000 calls framing it per byte.
+  EPD_WR_DATA_BULK(Image, (uint32_t)Width * Height);
   lut_GC();   
   EPD_Update();
 }
