@@ -60,58 +60,29 @@
 #define SETTLE_MS 100
 #endif
 
-// The resting frame is a different problem from playback, and the difference
-// is not exposure -- that was the first two guesses and both were wrong.
+// The resting frame is a different problem from playback.
 //
-// Measured on the glass: the waveform takes 1115ms to finish. Playback cuts it
-// at SETTLE_MS=100 and gets away with it, because the next frame arrives and
-// corrects whatever was left half done. The parked frame has no next frame, so
-// cutting it early left pixels mid-swing and the picture drifted away.
+// Playback cuts every frame at 100ms mid-waveform -- that is why it is fast --
+// so no pixel is ever driven all the way to a rail. Mid-clip that is fine: the
+// next frame arrives a tenth of a second later. The last frame has no next
+// frame, so a pixel left short of its rail leaks, and the picture drifts away.
+// Letting the waveform finish is what stopped that.
 //
-// Letting it finish fixed the fade and exposed the next thing: the late phases
-// of this LUT drive towards the opposite polarity, so a completed waveform
-// lands on the inverse of the picture a 100ms cut produces. INVERT=1 was tuned
-// against the cut, not against the finished state. So the resting frame is
-// complemented before it is pushed, and the completed waveform then lands on
-// the same picture playback was showing.
+// It also flips the polarity. INVERT=1 was tuned against the 100ms cut, and a
+// completed waveform lands on the opposite of what the cut shows, so the
+// resting frame is complemented to compensate.
 //
-// (PARK_REINFORCE, which wrote the image to DTM1/0x10 as well as DTM2/0x13,
-// lived here for a while on the theory that the old buffer was undefined after
-// the reset. It was not the cause -- the inversion predated it -- and it broke
-// the rule at the top of this file that every frame goes through the same
-// registers, so it is gone.)
-#ifndef PARK_INVERT
-#define PARK_INVERT 1
-#endif
-
-// Drive every pixel the full distance when parking.
-//
-// DTM1 (0x10) is the image the controller believes it is coming FROM, DTM2
-// (0x13) the one it is going TO, and the LUT picks a path per pixel from that
-// pair. Playback only ever writes DTM2, which is fine there -- a pixel routed
-// down a no-change path and left untouched gets another chance a tenth of a
-// second later. The resting frame gets no second chance, and a pixel that was
-// never driven never reaches a rail, so it leaks. That is the fade.
-//
-// Writing DTM1 as the exact inverse of DTM2 forces every pixel to transition,
-// which is the hardest the panel can drive it. It also means the whole screen
-// visibly swings on the way through, which is what a full e-paper refresh
-// looks like and is why parking flashes before it settles.
-//
-// (An earlier version wrote DTM1 equal to DTM2 instead, to "hold" each pixel.
-// That is the opposite of what is wanted here: equal means no transition,
-// which means no drive, which is the thing that fades.)
-#ifndef PARK_FULL_SWING
-#define PARK_FULL_SWING 1
-#endif
-
-#ifndef PARK_POWER_OFF
-#define PARK_POWER_OFF 1
-#endif
-
-// Longest the resting frame is allowed to take before we stop waiting on it.
-// A full waveform is seconds, not milliseconds; this is only a backstop so a
-// panel that never reports finished cannot hang the sketch forever.
+// KNOWN UNSOLVED: the parked frame still shows a ghost of the previous
+// picture. Tried and ruled out, all measured on the glass -- longer exposures;
+// writing DTM1 as the same image, as the inverse, and as the true previous
+// frame; the panel's OTP waveform (there is none: BUSY released after 75ms
+// against 1110ms); six alternating full-panel clears through the vendor's own
+// EPD_Clear register path; forcing white<->black full swings; holding the
+// rails 800ms past the end of each clear. None of it shifted the ghost. The
+// likely answer is that this driver is a mix of two controllers' register sets
+// -- the board is a UC8276C, EPD_Display writes images to 0x24 which is an
+// SSD16xx register, and EPD_Init_Fast is SSD16xx throughout -- and the fix is
+// a driver written for the part, not more sequencing here.
 #ifndef PARK_MAX_WAIT_MS
 #define PARK_MAX_WAIT_MS 10000
 #endif
@@ -164,6 +135,7 @@ struct Clip {
 #include "clips.h"
 
 static uint8_t frameBuf[FRAME_BYTES];
+
 static bool nextClip = false;
 static bool parkNow  = false;
 static bool keyDown[KEY_COUNT] = { false };
@@ -205,7 +177,7 @@ static void settle(uint32_t ms) {
 // EPD_Sleep() is DSLP alone, no POF. That is deliberate: POF aborts the
 // waveform outright and all you get is the opening black/white flash phases.
 static void pushFrame(uint32_t drawMs, bool powerDown = false,
-                      bool waitDone = false, bool fullSwing = false) {
+                      bool waitDone = false) {
   const uint32_t m0 = millis();
   EPD_RESET();
   delay(RESET_SETTLE_MS);
@@ -213,14 +185,6 @@ static void pushFrame(uint32_t drawMs, bool powerDown = false,
   EPD_Init();
   delay(INIT_SETTLE_MS);
   const uint32_t m2 = millis();
-
-  // Same registers and the same LUT as every other frame; this only fills in
-  // DTM1, the half of the pair playback never writes, and fills it with the
-  // inverse of what EPD_Display_Fast is about to put in DTM2.
-  if (fullSwing) {
-    EPD_WR_REG(0x10);
-    for (size_t i = 0; i < FRAME_BYTES; i++) EPD_WR_DATA8((uint8_t)~frameBuf[i]);
-  }
 
   EPD_Display_Fast(frameBuf);   // 0x50=0xD7, writes 0x13, lut_GC, 0x17/0xA5
   const uint32_t m3 = millis();
@@ -263,7 +227,7 @@ static void pushFrame(uint32_t drawMs, bool powerDown = false,
   // stranded charge from bleeding back out when the supply dies, and it is NOT
   // used during playback -- POF on every frame aborts the next waveform and all
   // you get is the black/white flash.
-  if (powerDown && PARK_POWER_OFF) {
+  if (powerDown) {
     EPD_WR_REG(0x02);           // POF
     delay(200);
   }
@@ -322,26 +286,48 @@ static void park() {
   Serial.println("parking -- safe to unplug");
   Serial.flush();
 
-  // frameBuf still holds what is on screen. Complement it so that a completed
-  // waveform lands on that same picture rather than its inverse, then push it
-  // through the identical path -- the only differences are that we wait for
-  // the waveform to finish and bring the rails down deliberately afterwards.
-#if PARK_INVERT
+  // frameBuf still holds what is on screen. Complement it, so that a waveform
+  // allowed to finish lands on that same picture instead of its inverse, then
+  // push it through the identical path -- the only differences are the wait
+  // and bringing the rails down deliberately afterwards.
   for (size_t i = 0; i < FRAME_BYTES; i++) frameBuf[i] = (uint8_t)~frameBuf[i];
-#endif
-  pushFrame(0, true, true, PARK_FULL_SWING);   // drawMs unused: waitDone replaces the cut
+  pushFrame(0, true, true);   // drawMs unused: the wait replaces the cut
 
   // DO NOT pull GPIO7/GPIO41 low here. GPIO41 is the board's power-control
   // latch, not just display power: driving it low hard-powers-off the whole
   // board including the USB-serial bridge, and it needs a physical replug to
   // come back. It buys nothing anyway -- the panel is bistable and already
   // asleep, and the ESP32 is about to drop to microamps.
+  // Hand the keys to the RTC domain before leaning on their pullups.
+  //
+  // setup() configures them with pinMode(INPUT_PULLUP), which is the digital
+  // GPIO domain -- and that domain is powered down in deep sleep. Calling
+  // rtc_gpio_pullup_en() without rtc_gpio_init() first leaves the pin still
+  // owned by the digital side, so the pullup goes away with it and the input
+  // floats. ext1 is armed ANY_LOW, so a floating pin is a wake.
+  //
+  // Measured: the board woke on its own with "wake cause: 3  ext1 pins: 0x20"
+  // -- GPIO5, untouched -- then reset clipIdx and started redrawing picture 1.
+  // A first frame half-drawn at 100ms over the parked picture is what looked
+  // like the parked frame ghosting and fading.
   uint64_t mask = 0;
   for (uint8_t k = 0; k < KEY_COUNT; k++) {
+    const gpio_num_t pin = (gpio_num_t)KEYS[k];
     mask |= 1ULL << KEYS[k];
-    rtc_gpio_pullup_en((gpio_num_t)KEYS[k]);
-    rtc_gpio_pulldown_dis((gpio_num_t)KEYS[k]);
+    rtc_gpio_init(pin);
+    rtc_gpio_set_direction(pin, RTC_GPIO_MODE_INPUT_ONLY);
+    rtc_gpio_pullup_en(pin);
+    rtc_gpio_pulldown_dis(pin);
   }
+  // ANY_LOW wakes the instant any of these reads low, so a pin that is already
+  // low when we sleep means we never sleep at all. Report them first.
+  Serial.printf("keys before sleep:");
+  for (uint8_t k = 0; k < KEY_COUNT; k++) {
+    Serial.printf(" gpio%u=%d", KEYS[k], digitalRead(KEYS[k]));
+  }
+  Serial.printf("  mask=0x%llx\n", (unsigned long long)mask);
+  Serial.flush();
+
   esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
   esp_deep_sleep_start();   // does not return; wake restarts at setup()
 }
@@ -354,6 +340,17 @@ void setup() {
   Serial.printf("\nCrowPanel 4.2\" video player (invert=%d settle=%d)\n",
                 INVERT, SETTLE_MS);
 
+  // Why are we awake? A park that is immediately undone by a spurious wake
+  // looks exactly like a frame that failed to latch: the picture is replaced
+  // by a half-drawn first frame of the next round, which reads as fading.
+  const esp_sleep_wakeup_cause_t why = esp_sleep_get_wakeup_cause();
+  Serial.printf("wake cause: %d", (int)why);
+  if (why == ESP_SLEEP_WAKEUP_EXT1) {
+    Serial.printf("  ext1 pins: 0x%llx",
+                  (unsigned long long)esp_sleep_get_ext1_wakeup_status());
+  }
+  Serial.println();
+
   for (uint8_t k = 0; k < KEY_COUNT; k++) pinMode(KEYS[k], INPUT_PULLUP);
 
   pinMode(41, OUTPUT); digitalWrite(41, HIGH);   // V1.2A display power
@@ -361,6 +358,7 @@ void setup() {
   delay(100);
 
   EPD_GPIOInit();
+
 
   // No EPD_Clear() here on purpose. The first frame paints all 400x300 anyway,
   // and clearing on boot means a brownout reset -- exactly what pulling the
