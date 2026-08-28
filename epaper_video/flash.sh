@@ -14,7 +14,7 @@
 set -euo pipefail
 
 INV="${1:-1}"
-SETTLE="${2:-500}"
+SETTLE="${2:-100}"
 PORT="${3:-/dev/cu.usbserial-110}"
 SKETCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 

@@ -17,7 +17,10 @@
  * TWO THINGS ABOUT THIS PANEL, BOTH OF WHICH DRIVE EVERY DECISION BELOW.
  *
  * 1. SETTLE_MS IS NOT A SETTLING TIME, IT IS AN EXPOSURE. Measured on the
- *    glass: 500ms gives a correct picture, 4000ms gives a solid black screen.
+ *    glass: 100ms and 500ms both give a correct picture, 4000ms gives a solid
+ *    black screen. 100 is the current default -- it plays roughly five times
+ *    faster and still looks right, but see 2: looking right and being latched
+ *    are not the same test, and the second one needs the cord pulled.
  *    So this LUT does not converge on the image and stop -- left running it
  *    keeps driving until everything saturates to one rail. Cutting it off is
  *    not a shortcut around a slow panel, it is the whole mechanism. There is
@@ -53,7 +56,7 @@
 // Exposure per frame. Tune it on the glass: raise it until the picture starts
 // going dark, then back off. Bigger = better latched = safer to unplug.
 #ifndef SETTLE_MS
-#define SETTLE_MS 500
+#define SETTLE_MS 100
 #endif
 
 

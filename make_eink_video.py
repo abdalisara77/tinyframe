@@ -6,22 +6,25 @@ Photos in, flashable firmware data out.
     python3 make_eink_video.py
     cd epaper_video && ./flash.sh
 
-For every photo in pictures/, two API calls and a local encode:
+Realistic: the photograph is kept as a photograph. There is no stylising
+step, because the look comes from the halftone at the end -- a photo dithered
+to one bit already reads as a picture, and anything a model redraws first is
+detail the dither then has to invent tone for.
 
-    1. black and white   photo -> 4:3 ink drawing   (Replicate, costs money)
-    2. video             drawing -> 3 second clip   (Replicate, costs money)
-    3. panel master      clip -> 400x300, 1 bit     (ffmpeg, local, free)
+For every photo in pictures/, one API call and a local encode:
+
+    1. video             photo -> 3 second clip     (Replicate, costs money)
+    2. panel master      clip -> 400x300, 1 bit     (ffmpeg, local, free)
 
 then every master is packed into one generated header:
 
-    4. clips             all masters -> epaper_video/clips.h
+    3. clips             all masters -> epaper_video/clips.h
 
 clips.h holds the frame data *and* the CLIPS[] table, so the sketch contains no
 clip-specific anything and adding a photo never means editing firmware. It is
 generated, gitignored, and rebuilt from pictures/ on demand -- no picture's
 byte data is ever a source file.
 
-    bw/<name>.jpg            the black-and-white still
     videos/raw/<name>.mp4    what the video model returned
     videos/<name>.mp4        the panel master -- watch this to see what ships
     epaper_video/clips.h     generated, gitignored
@@ -42,7 +45,6 @@ import replicate
 load_dotenv(override=True)
 
 PICTURES = "pictures"
-BW = "bw"
 OUT = "videos"
 RAW = os.path.join(OUT, "raw")
 SKETCH = "epaper_video"
@@ -67,22 +69,7 @@ EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic")
 
 
 # --------------------------------------------------------------------------
-# 1. photo -> black-and-white still
-# --------------------------------------------------------------------------
-
-MODEL_BW = "google/nano-banana-2"
-
-BW_PROMPT = (
-"Convert this photograph to a detailed and realistic black " 
-"and white watercolor drawing illustration. Bold clean linework,"
-" simple flat shapes. Keep the same people, the same faces and "
-" the same composition. Do not add any other people or objects. "
-"Keep the people pretty."
-)
-
-
-# --------------------------------------------------------------------------
-# 2. still -> video
+# 1. photo -> video
 # --------------------------------------------------------------------------
 
 MODEL_VIDEO = "xai/grok-imagine-video-1.5"
@@ -91,17 +78,20 @@ MODEL_VIDEO = "xai/grok-imagine-video-1.5"
 # do *not* want -- has to be said here, positively. The faces come first
 # because that is the thing most worth keeping: an image-to-video model is free
 # to redraw a face a little more each frame, and by the end it is someone else.
-# Restating the style matters too, or the model drifts back towards photograph.
+# "no illustration" is doing real work: asked only for movement, these models
+# drift towards looking rendered, and rendered is what this branch is avoiding.
 VIDEO_PROMPT = (
-    "black and white watercolor illustration, unchanged drawing style, "
+    "the same photograph, photorealistic and unchanged, "
     "the same people, faces unchanged and clearly recognisable, "
+    "natural skin, natural light, real photography, "
+    "not a drawing, not an illustration, not a painting, "
     "slow gentle camera drift, subtle natural movement, "
-    "steady locked-off framing."
+    "steady locked-off framing"
 )
 
 
 # --------------------------------------------------------------------------
-# 3. -> the panel master
+# 2. -> the panel master
 # --------------------------------------------------------------------------
 
 # Fit the whole picture inside 400x300 and pad out the remainder, rather than
@@ -201,31 +191,13 @@ def download(output, dst):
         fh.write(output.read())
 
 
-def make_black_and_white(photo, dst):
-    """API call 1: photo -> 4:3 black-and-white still."""
-    output = replicate.run(MODEL_BW, input={
-        # image_input, and it is an ARRAY. Pass anything else -- input_image,
-        # image -- and the model does not complain: it drops the unknown field
-        # and generates from the prompt alone, which looks like a working call
-        # that returns a confident picture of complete strangers.
-        "image_input": [data_uri(photo)],
-        "prompt": BW_PROMPT,
-        "aspect_ratio": "4:3",
-        # jpg keeps this small, because step 2 has to carry it back up as a
-        # data URI. The hard-edge argument for png does not survive the video
-        # model in between, which re-encodes far more destructively than jpeg.
-        "output_format": "jpg",
-    })
-    download(output, dst)
-
-
-def make_video(still, dst):
-    """API call 2: still -> short clip, faces and style kept as they are."""
+def make_video(photo, dst):
+    """The only API call: photo -> short clip, faces kept as they are."""
     output = replicate.run(MODEL_VIDEO, input={
-        "image": data_uri(still),
+        "image": data_uri(photo),
         "prompt": VIDEO_PROMPT,
-        # the still is already 4:3 and so is the panel, so say so rather than
-        # letting the model default to the image's native shape
+        # the panel is 4:3, so say so rather than letting the model default to
+        # the photo's native shape and leaving step 2 to pad the difference
         "aspect_ratio": "4:3",
         "resolution": "720p",
         "duration": DURATION,
@@ -241,7 +213,7 @@ def make_master(src, dst):
 
 
 # --------------------------------------------------------------------------
-# 4. masters -> one generated header
+# 3. masters -> one generated header
 # --------------------------------------------------------------------------
 
 def read_frames(master):
@@ -330,12 +302,12 @@ def emit_clips(clips, path):
 # --------------------------------------------------------------------------
 
 def main():
+    load_dotenv()   # the token lives in .env next to this script
     if not os.path.isdir(PICTURES):
         raise SystemExit("no %s/ directory -- put your photos there" % PICTURES)
     if not os.environ.get("REPLICATE_API_TOKEN"):
         raise SystemExit("set REPLICATE_API_TOKEN, or put it in .env")
 
-    os.makedirs(BW, exist_ok=True)
     os.makedirs(RAW, exist_ok=True)
     photos = sorted(f for f in os.listdir(PICTURES) if f.lower().endswith(EXTS))
     if not photos:
@@ -345,7 +317,6 @@ def main():
     for photo in photos:
         stem = os.path.splitext(photo)[0]
         name = re.sub(r"\W+", "_", stem).strip("_").lower()
-        still = os.path.join(BW, name + ".jpg")
         raw = os.path.join(RAW, name + ".mp4")
         master = os.path.join(OUT, name + ".mp4")
 
@@ -353,15 +324,11 @@ def main():
         # the thing it feeds is missing. Flat checks would re-run a paid call
         # to rebuild an input that nothing downstream still wants.
         print("%s" % name)
-        print(BW_PROMPT)
         if not os.path.exists(master):
             if not os.path.exists(raw):
-                if not os.path.exists(still):
-                    print("  1/4  black and white")
-                    make_black_and_white(os.path.join(PICTURES, photo), still)
-                print("  2/4  video")
-                make_video(still, raw)
-            print("  3/4  panel master")
+                print("  1/3  video")
+                make_video(os.path.join(PICTURES, photo), raw)
+            print("  2/3  panel master")
             make_master(raw, master)
 
         # An optional pictures/<name>.txt is drawn over the top-left corner.
