@@ -14,8 +14,11 @@
 set -euo pipefail
 
 INV="${1:-1}"
-SETTLE="${2:-500}"
-PORT="${3:-/dev/cu.usbserial-110}"
+SETTLE="${2:-100}"
+# Auto-detect: macOS renumbers this device on every replug, and a stale
+# hardcoded port fails the upload with a message about the ESP not being
+# connected, which sends you looking at the board instead of at the path.
+PORT="${3:-$(ls /dev/cu.usbserial-* 2>/dev/null | head -1)}"
 SKETCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # The board is a V1.2A (green sticker) / UC8176. The other driver is kept in
