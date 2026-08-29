@@ -30,3 +30,11 @@ epaper_video/clips.h
 
 # Artifacts from the watercolour branch, kept out of the realistic run.
 watercolor_run/
+
+# CAD render packages. Rebuilt on demand by the CAD tooling from the .step.py
+# sources next to them, and large.
+__cadgen__/
+
+# Elecrow's own STEP model of the board, fetched for the fit check. Theirs, not
+# ours, and 8 MB -- case/README.md has the one command that gets it.
+case/reference/
