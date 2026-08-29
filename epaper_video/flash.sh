@@ -3,14 +3,17 @@
 #
 #   ./flash.sh [invert] [settle_ms] [port]
 #     invert  1 = white artwork on black [default], 0 = black on white
-#     settle  exposure per frame in ms [default 500]. NOT a settling time --
+#     settle  exposure per frame in ms [default 100]. NOT a settling time --
 #             this panel keeps driving for as long as you give it, so too low
 #             leaves frames faint/torn and too high saturates them to black
-#             (measured: 500 good, 4000 solid black). The largest value that
-#             has not started to darken is also the safest to unplug at.
+#             (measured: 100 and 500 both good, 4000 solid black). The largest
+#             value that has not started to darken is also the safest to
+#             unplug at.
+#     port    serial port [default: the first /dev/cu.usbserial-* found]
 #
-# Regenerate frames from a different video with:
-#   python3 tools/make_video_header.py <video.mp4> --fps 8
+# Frames come from clips.h, which is generated and gitignored. Rebuild it from
+# every photo in pictures/ with:
+#   (cd .. && python3 make_eink_video.py)     # paths are relative to the root
 set -euo pipefail
 
 INV="${1:-1}"
