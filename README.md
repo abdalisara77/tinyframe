@@ -1,4 +1,4 @@
-# tinyboard
+# TinyFrame
 
 An e-paper photo player for the Elecrow CrowPanel ESP32 4.2" (400x300 mono).
 
