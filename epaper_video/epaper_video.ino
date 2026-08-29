@@ -72,17 +72,56 @@
 // completed waveform lands on the opposite of what the cut shows, so the
 // resting frame is complemented to compensate.
 //
-// KNOWN UNSOLVED: the parked frame still shows a ghost of the previous
-// picture. Tried and ruled out, all measured on the glass -- longer exposures;
-// writing DTM1 as the same image, as the inverse, and as the true previous
-// frame; the panel's OTP waveform (there is none: BUSY released after 75ms
-// against 1110ms); six alternating full-panel clears through the vendor's own
-// EPD_Clear register path; forcing white<->black full swings; holding the
-// rails 800ms past the end of each clear. None of it shifted the ghost. The
-// likely answer is that this driver is a mix of two controllers' register sets
-// -- the board is a UC8276C, EPD_Display writes images to 0x24 which is an
-// SSD16xx register, and EPD_Init_Fast is SSD16xx throughout -- and the fix is
-// a driver written for the part, not more sequencing here.
+// GHOSTING ON THE PARKED FRAME. Tried and ruled out, all measured on the
+// glass -- longer exposures; writing DTM1 as the same image, as the inverse,
+// and as the true previous frame; the panel's OTP waveform (there is none:
+// BUSY released after 75ms against 1110ms).
+//
+// Also tried, but the test did not count: six alternating full-panel clears
+// through the vendor's EPD_Clear path, white<->black full swings, and holding
+// the rails 800ms past the end of each clear. EPD_Clear ends in EPD_Update ->
+// EPD_ReadBusy, and EPD_ReadBusy breaks when BUSY reads 0 -- which is this
+// board's *busy* level, not its idle one (see pushFrame). So it returns as the
+// waveform starts and the next EPD_RESET cuts it off. Every one of those
+// clears was itself a truncated waveform: it stranded charge the same way a
+// 100ms playback frame does, rather than sweeping any off. See PARK_SWEEPS.
+//
+// Still open underneath all of it: this driver is a mix of two controllers'
+// register sets -- the board is a UC8276C, EPD_Display writes images to 0x24
+// which is an SSD16xx register, and EPD_Init_Fast is SSD16xx throughout. If
+// the sweep is not enough, the fix is a driver written for the part.
+// Let the panel go quiet before drawing the resting frame.
+//
+// A round ends with 72 waveforms that were each cut at 100ms, so the pixels
+// are still in transit when park begins -- charge redistributing, nothing
+// settled. Drawing immediately means the final waveform starts from a state
+// that is still moving. Waiting first gives it something stable to drive from.
+#ifndef PARK_QUIESCE_MS
+#define PARK_QUIESCE_MS 5000
+#endif
+
+// Full-panel swings to both rails, run at park before the resting frame.
+//
+// The point is DC balance, not clearing the screen. Playback ends with charge
+// stranded on the dielectric in a per-pixel pattern that mirrors the last
+// frames drawn -- every waveform was cut at SETTLE_MS, so none of them ever
+// reached the balancing tail. Driving every pixel rail to rail, with the
+// waveform ALLOWED TO FINISH each time, is what sweeps that back off. The
+// resting frame is then drawn from a uniform panel with no per-pixel history
+// left in it for the image to drift back toward.
+//
+// These go through pushFrame(waitDone=true), which reads BUSY's polarity and
+// waits for it to release. They deliberately do NOT go through EPD_Clear() --
+// that path cannot wait (see above) and would strand charge instead of
+// sweeping it.
+//
+// Counted in white/black pairs, so the net drive stays balanced. Which rail
+// the last sweep lands on does not matter for correctness: the resting frame
+// drives every pixel from uniform either way.
+#ifndef PARK_SWEEPS
+#define PARK_SWEEPS 2
+#endif
+
 #ifndef PARK_MAX_WAIT_MS
 #define PARK_MAX_WAIT_MS 10000
 #endif
@@ -135,6 +174,11 @@ struct Clip {
 #include "clips.h"
 
 static uint8_t frameBuf[FRAME_BYTES];
+
+// The resting image, stashed before park sweeps overwrite frameBuf with solid
+// rails. EXIT can land mid-clip, so re-decoding it afterwards is not an option
+// -- by then the only record of what is on the glass is frameBuf itself.
+static uint8_t parkBuf[FRAME_BYTES];
 
 static bool nextClip = false;
 static bool parkNow  = false;
@@ -286,11 +330,34 @@ static void park() {
   Serial.println("parking -- safe to unplug");
   Serial.flush();
 
-  // frameBuf still holds what is on screen. Complement it, so that a waveform
-  // allowed to finish lands on that same picture instead of its inverse, then
-  // push it through the identical path -- the only differences are the wait
-  // and bringing the rails down deliberately afterwards.
-  for (size_t i = 0; i < FRAME_BYTES; i++) frameBuf[i] = (uint8_t)~frameBuf[i];
+  // frameBuf still holds what is on screen. Keep it -- the sweeps below are
+  // about to fill frameBuf with solid rails.
+  memcpy(parkBuf, frameBuf, FRAME_BYTES);
+
+  // Let whatever playback left in flight settle before driving anything.
+  Serial.printf("park: quiescing %d ms\n", PARK_QUIESCE_MS);
+  Serial.flush();
+  settle(PARK_QUIESCE_MS);
+
+  // Sweep both rails, each waveform run to completion, to pull the stranded
+  // per-pixel charge back off before anything is drawn. No powerDown yet: POF
+  // belongs at the very end, and firing it here would abort the next sweep.
+  for (uint8_t s = 0; s < PARK_SWEEPS; s++) {
+    Serial.printf("park: sweep %u/%u\n", (unsigned)(s + 1),
+                  (unsigned)PARK_SWEEPS);
+    Serial.flush();
+    memset(frameBuf, 0xFF, FRAME_BYTES);
+    pushFrame(0, false, true);
+    memset(frameBuf, 0x00, FRAME_BYTES);
+    pushFrame(0, false, true);
+  }
+
+  // Now the resting frame, onto a panel with no history left in it.
+  // Complement it, so that a waveform allowed to finish lands on that same
+  // picture instead of its inverse, then push it through the identical path --
+  // the only differences are the wait and bringing the rails down deliberately
+  // afterwards.
+  for (size_t i = 0; i < FRAME_BYTES; i++) frameBuf[i] = (uint8_t)~parkBuf[i];
   pushFrame(0, true, true);   // drawMs unused: the wait replaces the cut
 
   // DO NOT pull GPIO7/GPIO41 low here. GPIO41 is the board's power-control
